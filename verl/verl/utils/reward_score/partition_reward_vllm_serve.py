@@ -11,7 +11,7 @@ import math
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG – adjust HOSTNAME if needed
 # ──────────────────────────────────────────────────────────────────────────────
-HOSTNAME    = os.environ["VLLM_SERVER_HOSTNAME"] 
+HOSTNAME    = os.environ["VLLM_SERVER_HOSTNAME"]
 NUM_SERVERS  = 8
 SERVER_CFGS  = [
     {"url": f"http://{HOSTNAME}:{8000+i}", "model": f"similarity_gpu_{i}"}

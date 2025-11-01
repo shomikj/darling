@@ -1,11 +1,21 @@
+#!/bin/bash
+#SBATCH --job-name=grpo_baseline
+#SBATCH --account=ai_society
+#SBATCH --qos=h200_dev
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:8
+#SBATCH --exclusive
+#SBATCH --time=48:00:00
+#SBATCH --output=/home/shomikj/logs/%j.out
+#SBATCH --error=/home/shomikj/logs/%j.err
 B=32
 N=8
 L=1024
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/checkpoint/ram/tianjian/wildchat10k.parquet \
-    data.val_files=/checkpoint/ram/tianjian/creative_writing_data/valid.parquet \
+    data.train_files=/checkpoint/ai_society/shomikj/wildchat10k.parquet \
+    data.val_files=/checkpoint/ai_society/shomikj/valid.parquet \
     data.prompt_key="prompt" \
     data.train_batch_size=${B} \
     data.max_prompt_length=512 \
@@ -36,21 +46,21 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
-    custom_reward_function.path=/home/$USER/diverse_responses/verl/verl/utils/reward_score/diversity_rewards.py \
+    custom_reward_function.path=/home/shomikj/darling/verl/verl/utils/reward_score/diversity_rewards.py \
     custom_reward_function.name=ngram \
     reward_model.reward_manager=diversity \
     reward_model.enable=True \
-    reward_model.model.input_tokenizer=/checkpoint/ram/tianjian/reward_models/Athene-RM-8B \
-    reward_model.model.path=/checkpoint/ram/tianjian/reward_models/Athene-RM-8B \
+    reward_model.model.input_tokenizer=/checkpoint/ai_society/shomikj/Athene-RM-8B \
+    reward_model.model.path=/checkpoint/ai_society/shomikj/Athene-RM-8B \
     reward_model.micro_batch_size_per_gpu=16 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='athene' \
-    trainer.experiment_name=quality_only_b${B}_n${N}_l${L} \
+    trainer.project_name='llama_8b_wildchat' \
+    trainer.experiment_name=grpo_baseline_b${B}_n${N}_l${L} \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=200 \
     trainer.test_freq=200 \
-    trainer.default_local_dir=/checkpoint/ram/tianjian/checkpoints_athene/wildchat10k_quality_only_b${B}_n${N}_l${L}_baseline \
-    trainer.validation_data_dir=/checkpoint/ram/tianjian/checkpoints_athene/wildchat10k_quality_only_b${B}_n${N}_l${L}_baseline/rollouts \
+    trainer.default_local_dir=/checkpoint/ai_society/shomikj/grpo_training/wildchat_baseline_b${B}_n${N}_l${L} \
+    trainer.validation_data_dir=/checkpoint/ai_society/shomikj/grpo_training/wildchat_baseline_b${B}_n${N}_l${L}/rollouts \
     trainer.total_epochs=10 $@ +reward_model.lambda_rule_rescale=0.0 

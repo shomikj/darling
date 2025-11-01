@@ -1,4 +1,17 @@
+#!/bin/bash
+#SBATCH --job-name=darling_test
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=96
+#SBATCH --gpus-per-node=8
+#SBATCH --time=24:00:00
+#SBATCH --partition=
+#SBATCH --output=logs/%j.out         # Output file
+#SBATCH --error=logs/%j.err          # Error file
+#SBATCH --account=your_account       # If required
 
+# Your existing script starts here...
+source ~/.bashrc
 source ~/.bashrc
 source ~/.zshrc
 conda init

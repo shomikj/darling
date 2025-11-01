@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=grpo_darling
+#SBATCH --job-name=grpo_darling_ta
 #SBATCH --account=ai_society
 #SBATCH --qos=h200_alignment_shared
 #SBATCH --nodes=1
@@ -12,12 +12,11 @@
 B=32
 N=8
 L=1024
-
-export VLLM_SERVER_HOSTNAME=h200-164-149.fair-sc-3-compute-compute.tenant-slurm.svc.cluster.local
+R=3
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/checkpoint/ai_society/shomikj/wildchat10k.parquet \
+    data.train_files=/checkpoint/ai_society/shomikj/wildchat10k_merged.parquet \
     data.val_files=/checkpoint/ai_society/shomikj/valid.parquet \
     data.prompt_key="prompt" \
     data.train_batch_size=${B} \
@@ -58,14 +57,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='llama_8b_wildchat' \
-    trainer.experiment_name=grpo_darling_b${B}_n${N}_l${L} \
+    trainer.experiment_name=grpo_darling_ta${R}_b${B}_n${N}_l${L} \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=200 \
     trainer.resume_mode='auto' \
     trainer.test_freq=200 \
-    trainer.default_local_dir=/checkpoint/ai_society/shomikj/grpo_training/wildchat_darling_b${B}_n${N}_l${L} \
-    trainer.validation_data_dir=/checkpoint/ai_society/shomikj/grpo_training/wildchat_darling_b${B}_n${N}_l${L}/rollouts \
+    trainer.default_local_dir=/checkpoint/ai_society/shomikj/grpo_training/wildchat_darling_ta${R}_b${B}_n${N}_l${L} \
+    trainer.validation_data_dir=/checkpoint/ai_society/shomikj/grpo_training/wildchat_darling_ta${R}_b${B}_n${N}_l${L}/rollouts \
     trainer.total_epochs=10 $@ +reward_model.multiplicative=True \
-    +reward_model.custom_diversity_function.path=/home/shomikj/darling/verl/verl/utils/reward_score/partition_reward_vllm_serve_modernbert.py \
+    +reward_model.custom_diversity_function.path=/home/shomikj/darling/verl/verl/utils/reward_score/partition_reward_lm_judge.py \
     +reward_model.custom_diversity_function.name=partition

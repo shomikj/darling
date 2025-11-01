@@ -2,29 +2,74 @@ import asyncio
 import functools
 import math
 from typing import Dict, List, Optional, Tuple
-
+import pandas as pd
 import httpx
+from openai import AsyncAzureOpenAI
+import os
+import random
+import atexit
+from datasets import load_dataset
+import re
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CONFIG  – adjust HOSTNAME if needed
+# CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-HOSTNAME = "cr1-h200-p5en48xlarge-4"
-NUM_SERVERS = 2  # two LM‑judge instances
-SERVER_CFGS = [
-    {"url": f"http://{HOSTNAME}:{9000 + i}", "model": f"judge_gpu_{i}"}
-    for i in range(NUM_SERVERS)
-]
+
+TAXONOMY_CLASSIFICATION_PROMPT = """Read the prompt below and decide which task category it belongs to. Only output a single category letter (A, B, C, D, E, F, or G) without any additional text. For prompts that have objective responses, choose from categories A, B, C, or D. For prompts that have subjective responses, choose from categories E, F, or G.
+
+Prompt: {prompt}
+
+Task Categories:
+A — Well-Specified Singular Objective: Task to generate a single verifiable correct answer.
+B — Underspecified Singular Objective: Task to generate a single answer for a prompt that has multiple verifiable correct answers.
+C — Random Generation Objective: Task to generate a response that involves randomizing over a set of finite options.
+D — Problem Solving Objective: Task to generate an answer with reasoning or explanations for a problem with a single verifiable correct answer.
+E — Encyclopedia Inquiry Subjective: Task to generate information about real-world societies, traditions, events, or social domains, where there are credible references.
+F — Creative Generation Subjective: Task to generate a response that involves creative expression where there are potentially infinite subjective responses.
+G — Advice or Opinion Subjective: Task to generate a response that gives advice, opinions, or feedback on specific topics or scenarios.
+""".strip()
+
+dataset = load_dataset("parquet", data_files="/checkpoint/ai_society/shomikj/wildchat10k_merged.parquet")
+dataset['train'] = dataset['train'].map(lambda row: {"extracted_prompt": row["prompt"][0]["content"] if row["prompt"] else None})
+df = dataset['train'].to_pandas()
+df['extracted_prompt'] = df['extracted_prompt'].str.lower().str.replace(r'[^a-zA-Z0-9]', '', regex=True)
+PROMPT_CATEGORY_LOOKUP = dict(zip(df['extracted_prompt'], df['category_gpt']))
+
+diversity_judge_prefix = (
+    "For the given prompt and two responses, determine if the responses are functionally equivalent. "
+    "Functional equivalence means a user who has seen one response would find the other response to be redundant.\n\n"
+)
+
+diversity_judge_body = (
+    "\n\n###\n"
+    "Prompt: {prompt}\n\n"
+    "Response 1: {response_1}\n\n"
+    "Response 2: {response_2}\n"
+    "###\n\n"
+    "Are the responses functionally equivalent?\n"
+)
+
+diversity_judge_suffix = "\nOnly output YES or NO."
+
+df = pd.read_csv("/checkpoint/ai_society/shomikj/eval/prompt_templates.csv")
+df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
+DIVERSITY_JUDGE_PROMPTS = {}
+for i,r in df.iterrows():
+    DIVERSITY_JUDGE_PROMPTS[r["category"]] = (
+        diversity_judge_prefix + r["functional_equivalence_definition"] + diversity_judge_body + r["diversity_judge_options"] + diversity_judge_suffix
+    )
+
 
 MAX_RETRIES = 3
-RETRY_DELAY = 1.0  # seconds, exponential back‑off base
+RETRY_DELAY = 1.0
 
-# ──────────────────────────────────────────────────────────────────────────────
-# LIGHTWEIGHT CACHES
-# ──────────────────────────────────────────────────────────────────────────────
-@functools.lru_cache(maxsize=None)
-def get_client(base_url: str) -> httpx.AsyncClient:
-    """Return a cached AsyncClient for the given base URL."""
-    return httpx.AsyncClient(base_url=base_url, timeout=600)
+GPT_QUERIER = AsyncAzureOpenAI(
+            api_version="2024-06-01",
+            api_key=os.environ["OPEN_AI_TOKEN"],
+            azure_endpoint=os.environ["OPEN_AI_ENDPOINT"]
+)
+
+PROMPT_PREFIX = "system\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nuser\n\n"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # VERY CHEAP LOCAL CHECK FOR TINY ANSWERS
@@ -42,77 +87,79 @@ def maybe_test_equality(r0: str, r1: str) -> Optional[bool]:
 # REMOTE JUDGE CALL
 # ──────────────────────────────────────────────────────────────────────────────
 
-MATH_JUDGE_PROMPT = """
-You are given the original prompt and two model-generated responses. Determine whether the two responses use different strategies to solve the problem.
 
-Use the following guidelines:
-
-- Different solution methods: Clearly different approaches (e.g., algebraic vs. geometric, analytical vs. numerical).
-- Critical reasoning divergence: Significant differences in key reasoning steps or assumptions, even if final answers match.
-- Conceptual differences: Distinct underlying concepts or representations (e.g., probability vs. combinatorics).
-
-**Also label as different if:**  
-The two responses share the same general approach but differ meaningfully in specific intermediate steps or manipulations crucial to the solution.
-
-Generation 0:
-\"\"\"{gen0}\"\"\"
-
-Generation 1:
-\"\"\"{gen1}\"\"\"
-
-Question: Do Generation 0 and Generation 1 use different strategies? You may first generate a short reasoning, then respond with "[[yes]]" if the generations use different strategies or "[[no]]" if they do not. 
-"""
-
-async def remote_judge_equivalent(r0: str, r1: str, cfg: Dict) -> bool:
+async def remote_judge_equivalent(prompt:str, r0: str, r1: str) -> bool:
     """Return True if the LM judge says the responses are equivalent."""
+    prompt = prompt.replace(PROMPT_PREFIX, "").replace("assistant\n\n", "").strip()
 
-    prompt = MATH_JUDGE_PROMPT.format(prompt="", gen0=r0.strip(), gen1=r1.strip())
+    category = ""
+    hashed_prompt = re.sub(r'[^a-zA-Z0-9]', '', prompt.lower())
+    if hashed_prompt in PROMPT_CATEGORY_LOOKUP:
+        category = PROMPT_CATEGORY_LOOKUP[hashed_prompt]
+    else:
+        for attempt in range(MAX_RETRIES):
+            try:
+                messages = [{"role": "user", "content": TAXONOMY_CLASSIFICATION_PROMPT.format(prompt=prompt)}]
+                completion = await GPT_QUERIER.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    temperature=0.0,
+                    max_tokens=10,
+                    top_p = 1.0,
+                )
+                response = completion.choices[0].message.content.strip()
+                category = response.strip().upper()
+                if category in {"A", "B", "C", "D", "E", "F", "G"}:
+                    PROMPT_CATEGORY_LOOKUP[hashed_prompt] = category
+                    break
+            except Exception as e:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                print(f"{type(e).__name__} encountered with querying LLM-judge. Retrying in {wait_time:.2f} seconds...")
+                await asyncio.sleep(wait_time)
+    if category not in {"A", "B", "C", "D", "E", "F", "G"}:
+        print(f"Unexpected category '{category}' returned from LLM-classifier.")
+        category = "F"  # default to creative writing
 
-    payload = {
-        "model": cfg["model"],
-        "temperature": 0.0,
-        "messages": [
-            {"role": "user", "content": prompt},
-        ],
-    }
+    judge_prompt = DIVERSITY_JUDGE_PROMPTS[category].format(prompt=prompt, response_1=r0.strip(), response_2=r1.strip())
+
+    messages = [{"role": "user", "content": judge_prompt}]
 
     for attempt in range(MAX_RETRIES):
         try:
-            client = get_client(cfg["url"])
-            resp = await client.post("/v1/chat/completions", json=payload)
-            resp.raise_for_status()
-            content = (
-                resp.json()["choices"][0]["message"]["content"].strip().split()
+            completion = await GPT_QUERIER.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                temperature=0.0,
+                max_tokens=10,
+                top_p = 1.0,
             )
-            # extract the last occurence of [[Yes]] or [[No]]
-            verdict = content[-1].strip("[]").lower() == "yes" # they are similar
+            response = completion.choices[0].message.content.strip()
+            response = response.strip().lower()
+            if response not in {"yes", "no"}:
+                raise ValueError(f"Unexpected response from diversity LLM-judge: '{response}'")
 
-            return verdict
-
-        except (httpx.HTTPError, httpx.TimeoutException, httpx.ConnectError) as e:
-            # Refresh client on connection‑level errors
-            if isinstance(e, (httpx.ConnectError, httpx.ReadError)):
-                get_client.cache_clear()
-            if attempt == MAX_RETRIES - 1:
-                raise
-            await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
-
+            return response == "yes"  # judge says responses functionally equivalent
+        except Exception as e:
+            wait_time = (2 ** attempt) + random.uniform(0, 1)
+            print(f"{type(e).__name__} encountered with querying LLM-judge. Retrying in {wait_time:.2f} seconds...")
+            await asyncio.sleep(wait_time)
+    
     # Should never reach here
+    print("Max retries exceeded for remote judge call.")
     return False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EQUIVALENCE PREDICATE (local heuristic → remote judge)
 # ──────────────────────────────────────────────────────────────────────────────
 async def equivalence_check(
-    prompt: str,  # kept for signature compatibility (unused)
+    prompt: str,
     r0: str,
     r1: str,
-    cfg: Dict,
 ) -> bool:
     eq = maybe_test_equality(r0, r1)
     if eq is not None:
         return eq
-    return await remote_judge_equivalent(r0, r1, cfg)
+    return await remote_judge_equivalent(prompt, r0, r1)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UNION‑FIND PARTITIONING FOR ONE UID, RUN ON A GIVEN SERVER
@@ -122,7 +169,7 @@ async def process_uid_partition(
     responses: List[str],
     indices: List[int],
     prompt: str,
-    cfg: Dict,
+    LOCAL_SEM,
 ) -> Tuple[str, List[List[int]]]:
     n = len(responses)
     parent = list(range(n))
@@ -138,8 +185,9 @@ async def process_uid_partition(
             parent[pa] = pb
 
     async def check(i, j):
-        same = await equivalence_check(prompt, responses[i], responses[j], cfg)
-        return i, j, same
+        async with LOCAL_SEM:  # acquire semaphore slot
+            same = await equivalence_check(prompt, responses[i], responses[j])
+            return i, j, same
 
     tasks = [check(i, j) for i in range(n) for j in range(i + 1, n)]
     for i, j, same in await asyncio.gather(*tasks):
@@ -169,11 +217,11 @@ async def partition_async(
         by_uid_prompt.setdefault(u, prm)
 
     tasks = []
+    LOCAL_SEM = asyncio.Semaphore(16)
     for n, (u, resps) in enumerate(by_uid_resp.items()):
-        cfg = SERVER_CFGS[n % NUM_SERVERS]
         tasks.append(
             asyncio.create_task(
-                process_uid_partition(u, resps, by_uid_idx[u], by_uid_prompt[u], cfg)
+                process_uid_partition(u, resps, by_uid_idx[u], by_uid_prompt[u], LOCAL_SEM)
             )
         )
 
@@ -207,6 +255,13 @@ def partition(**kwargs) -> List[float]:
             for idx in grp:
                 rewards[idx] = distinct / denom
 
+    assert len(prompts) == len(rewards)
+    for i, prompt in enumerate(prompts):
+        prompt = prompt.replace(PROMPT_PREFIX, "").replace("assistant\n\n", "").strip()
+        hashed_prompt = re.sub(r'[^a-zA-Z0-9]', '', prompt.lower())
+        if PROMPT_CATEGORY_LOOKUP[hashed_prompt] == "A":
+            rewards[i] = 1.0 - rewards[i]
+
     return rewards
 
 
@@ -214,33 +269,9 @@ def partition_sigmoid(**kwargs) -> List[float]:
     """Sigmoid‑scaled version of `partition`."""
     return [1 / (1 + math.exp(-r)) for r in partition(**kwargs)]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SELF‑TEST (uses mocked LM‑judge that mirrors exact string match for demo)
-# ──────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-
-    async def mock_judge_equivalent(r0, r1, _cfg):
-        return r0.strip().lower() == r1.strip().lower()
-
-    # Monkey‑patch the remote call for offline testing
-    globals()["remote_judge_equivalent"] = mock_judge_equivalent
-
-    def test_partition():
-        solution_str = [
-            "Paris is the capital of France.",
-            "The capital of France is Paris.",
-            "France's capital is Paris.",
-            "Why do programmers prefer dark mode? Because light attracts bugs!",
-            "Why do programmers prefer dark mode? Because light attracts bugs.",
-            "This joke only works on my machine.",
-        ]
-        uid = ["uid1", "uid1", "uid1", "uid2", "uid2", "uid2"]
-        prompts = [
-            "What is the capital of France?", "", "", "", "", "",
-        ]
-        rewards = partition(solution_str=solution_str, uid=uid, prompts=prompts)
-        for r, rew in zip(solution_str, rewards):
-            print(f"{rew:.2f} → {r}")
-
-    test_partition()
+@atexit.register
+def close_gpt_client():
+    try:
+        asyncio.run(GPT_QUERIER.aclose())
+    except Exception:
+        pass

@@ -49,7 +49,7 @@ def maybe_test_equality(r0: str, r1: str) -> Optional[bool]:
 # ──────────────────────────────────────────────────────────────────────────────
 # TOKENISE TWO SENTENCES INTO  CLS sentence1 SEP sentence2 SEP
 # ──────────────────────────────────────────────────────────────────────────────
-def build_input_ids(s1: str, s2: str, tokenize=True) -> List[int]:
+def build_input_ids(s1: str, s2: str, tokenize=True):
     tok = get_tokenizer()
     cls, sep = tok.cls_token_id, tok.sep_token_id
 
@@ -73,10 +73,10 @@ async def remote_similarity_prob(s1: str, s2: str, cfg: Dict) -> float:
     """Return P(similar) from the remote classifier."""
     payload = {
         "model": cfg["model"],
+        "encoding_format": "float",
         "input": [build_input_ids(s1, s2, tokenize=False)],
     }
 
-    
     max_retries = 3
     retry_delay = 1.0  # Initial delay in seconds
     
@@ -86,15 +86,13 @@ async def remote_similarity_prob(s1: str, s2: str, cfg: Dict) -> float:
             client = get_client(cfg["url"])
             
             try:
-                resp = await client.post("/classify", json=payload)
+                resp = await client.post("/v1/embeddings", json=payload)
                 resp.raise_for_status()
-                
-                #print(resp.json())  # Debugging output
-                prob = resp.json()["data"][0]["probs"]
-                #print(f"payload: {payload}")  # Debugging output
-                #print(f"Logits: {logits}")  # Debugging output
-                return prob[-1]
-                
+                emb = resp.json()["data"][0]["embedding"]  # list[float] len == 2
+
+                logits = torch.tensor(emb)
+                prob = torch.softmax(logits, dim=0)[1].item()
+                return prob
             except (httpx.HTTPError, httpx.TimeoutException, httpx.ConnectError, 
                     httpx.ReadError, RuntimeError) as e:
                 # If we get a connection error or the "TCPTransport closed" runtime error
